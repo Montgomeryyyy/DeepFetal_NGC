@@ -165,6 +165,12 @@ def main():
         )
         return
 
+    # Ensure output directory exists
+    output_dir = os.path.dirname(args.output)
+    if output_dir and not os.path.exists(output_dir):
+        os.makedirs(output_dir, exist_ok=True)
+        print(f"Created output directory: {output_dir}")
+
     # Optional: safer to avoid partial final output
     tmp_output = args.output + ".tmp"
     if os.path.exists(tmp_output):
@@ -269,6 +275,11 @@ def main():
     
     # Save skipped CPRs to file
     if skipped_data:
+        # Ensure directory exists for skipped CPRs file
+        skipped_dir = os.path.dirname(skipped_cprs_file)
+        if skipped_dir and not os.path.exists(skipped_dir):
+            os.makedirs(skipped_dir, exist_ok=True)
+        
         skipped_df = pd.DataFrame(skipped_data)
         skipped_df.to_csv(skipped_cprs_file, index=False)
         print(f"\nSkipped CPRs saved to: {skipped_cprs_file}")
