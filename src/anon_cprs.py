@@ -43,17 +43,22 @@ def validate_cpr_format(cpr_str):
 def _pseudonymize_one(value):
     """
     Worker function for multiprocessing.
-    Takes a single CPR-like value, cleans + validates, then calls the pseudonymizer binary.
+    Takes a single CPR-like value, cleans, validates, then calls the pseudonymizer binary.
+    Returns (pseudonymized_value, is_invalid) tuple.
+    Invalid entries return (original_value, True) to skip them.
     """
     # Preserve missing values
     if pd.isna(value) or value is None or str(value).strip() == "":
-        return value
+        return (value, False)
 
+    # Clean the value
     cleaned = re.sub(r"[^a-zA-Z0-9]", "", str(value))
-
+    
+    # Validate format
     is_valid, error_msg = validate_cpr_format(cleaned)
     if not is_valid:
-        raise ValueError(f"Invalid CPR format: {error_msg}. Original value: {value}")
+        # Invalid entry - return original to skip, but mark as invalid
+        return (value, True)
 
     try:
         result = subprocess.run(
@@ -62,13 +67,15 @@ def _pseudonymize_one(value):
             text=True,
             check=True,
         )
+        pseudonymized = result.stdout.strip()
     except subprocess.CalledProcessError as e:
-        raise RuntimeError(
-            f"Pseudonymizer failed for value '{cleaned}'. "
-            f"Return code={e.returncode}. STDERR={e.stderr.strip()}"
-        ) from e
+        # Pseudonymizer failed - skip this entry
+        return (value, True)
+    except Exception as e:
+        # Any other error - skip this entry
+        return (value, True)
 
-    return result.stdout.strip()
+    return (pseudonymized, False)
 
 
 def anon_parallel(df, cols, workers=None):
@@ -77,10 +84,13 @@ def anon_parallel(df, cols, workers=None):
     Strategy:
       - For each column, pseudonymize only the UNIQUE non-missing values in parallel.
       - Map results back to the column (fast if many duplicates).
-    Returns anonymized dataframe and list of errors encountered.
+    Returns anonymized dataframe, list of errors, and statistics dict.
     """
     df = df.copy()
     errors = []
+    stats = {
+        "invalid_entries": {},    # {col: [list of invalid values that were skipped]}
+    }
 
     for col in cols:
         if col not in df.columns:
@@ -88,6 +98,7 @@ def anon_parallel(df, cols, workers=None):
             continue
 
         print(f"Processing column '{col}' (parallel)...")
+        stats["invalid_entries"][col] = []
 
         try:
             s = df[col]
@@ -102,9 +113,17 @@ def anon_parallel(df, cols, workers=None):
             unique_vals = s.loc[mask].astype(str).unique().tolist()
 
             with ProcessPoolExecutor(max_workers=workers) as ex:
-                pseudo_vals = list(ex.map(_pseudonymize_one, unique_vals))
+                results = list(ex.map(_pseudonymize_one, unique_vals))
 
-            mapping = dict(zip(unique_vals, pseudo_vals))
+            # Extract pseudonymized values, track invalid entries
+            mapping = {}
+            for orig_val, (pseudo_val, is_invalid) in zip(unique_vals, results):
+                if is_invalid:
+                    # Invalid entry - keep original value, track it
+                    mapping[orig_val] = orig_val
+                    stats["invalid_entries"][col].append(orig_val)
+                else:
+                    mapping[orig_val] = pseudo_val
 
             df.loc[mask, col] = s.loc[mask].astype(str).map(mapping)
 
@@ -112,7 +131,7 @@ def anon_parallel(df, cols, workers=None):
             errors.append(f"Error processing column '{col}': {str(e)}")
             break
 
-    return df, errors
+    return df, errors, stats
 
 
 def main():
@@ -167,6 +186,9 @@ def main():
     all_errors = []
     chunk_num = 0
     total_rows_processed = 0
+    all_stats = {
+        "invalid_entries": {},  # Accumulate across all chunks
+    }
 
     print(f"Reading file in chunks: {args.filepath}")
     
@@ -187,8 +209,14 @@ def main():
         print(f"\nProcessing chunk {chunk_num + 1}: rows {total_rows_processed} to {total_rows_processed + rows_in_chunk - 1}")
 
         try:
-            anonymized_chunk, errors = anon_parallel(chunk_df, cols_to_anonymize, workers=args.workers)
+            anonymized_chunk, errors, stats = anon_parallel(chunk_df, cols_to_anonymize, workers=args.workers)
             all_errors.extend(errors)
+
+            # Accumulate statistics
+            for col in stats["invalid_entries"]:
+                if col not in all_stats["invalid_entries"]:
+                    all_stats["invalid_entries"][col] = []
+                all_stats["invalid_entries"][col].extend(stats["invalid_entries"][col])
 
             if errors:
                 print(f"ERROR: Encountered {len(errors)} error(s). Stopping processing.")
@@ -219,15 +247,43 @@ def main():
     print("=" * 60)
     print(f"Total rows processed: {total_rows_processed}")
 
+    # Collect and save invalid entries that were skipped
+    skipped_cprs_file = args.output.replace(".asc", "_skipped_cprs.csv")
+    skipped_data = []
+    
+    for col in all_stats["invalid_entries"]:
+        invalid_list = all_stats["invalid_entries"][col]
+        if invalid_list:
+            unique_invalid = list(set(invalid_list))
+            print(f"\nColumn '{col}': {len(unique_invalid)} unique invalid entry/entries skipped")
+            
+            # Add to skipped data for saving
+            for val in unique_invalid:
+                skipped_data.append({"column": col, "skipped_value": val})
+            
+            if len(unique_invalid) <= 10:  # Only show if not too many
+                for val in unique_invalid[:10]:  # Show first 10
+                    print(f"  - '{val}'")
+                if len(unique_invalid) > 10:
+                    print(f"  ... and {len(unique_invalid) - 10} more")
+    
+    # Save skipped CPRs to file
+    if skipped_data:
+        skipped_df = pd.DataFrame(skipped_data)
+        skipped_df.to_csv(skipped_cprs_file, index=False)
+        print(f"\nSkipped CPRs saved to: {skipped_cprs_file}")
+    else:
+        print("\nNo invalid CPRs were skipped.")
+
     if all_errors:
-        print(f"ERRORS ENCOUNTERED: {len(all_errors)}")
+        print(f"\nERRORS ENCOUNTERED: {len(all_errors)}")
         for err in all_errors:
             print(f"  - {err}")
         print(f"\nWARNING: Output left as temp file for inspection: {tmp_output}")
         print("No original files were overwritten.")
     else:
         os.replace(tmp_output, args.output)
-        print("SUCCESS: All rows processed without errors.")
+        print("\nSUCCESS: All rows processed without errors.")
         print(f"Anonymized data saved to {args.output}")
         print("No original files were overwritten.")
 
