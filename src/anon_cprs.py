@@ -138,15 +138,6 @@ def main():
 
     cols_to_anonymize = [c.strip() for c in args.cols.split(",") if c.strip()]
 
-    print(f"Reading file: {args.filepath}")
-    df = pd.read_csv(args.filepath, sep="¤", engine="python")
-
-    print(f"Original file has {len(df)} rows")
-
-    if args.test:
-        print("TEST MODE: Processing only first 5 rows")
-        df = df.head(5).copy()
-
     # Do not overwrite any existing output
     if os.path.exists(args.output):
         print(
@@ -169,17 +160,31 @@ def main():
     if args.workers is not None:
         print(f"Parallel workers: {args.workers}")
 
-    total_rows = len(df)
+    # Read file in chunks instead of loading entire file
     chunk_size = args.chunk_size
     write_mode = "w"
     write_header = True
     all_errors = []
+    chunk_num = 0
+    total_rows_processed = 0
 
-    for start_idx in range(0, total_rows, chunk_size):
-        end_idx = min(start_idx + chunk_size, total_rows)
-        print(f"\nProcessing chunk: rows {start_idx} to {end_idx - 1}")
-
-        chunk_df = df.iloc[start_idx:end_idx].copy()
+    print(f"Reading file in chunks: {args.filepath}")
+    
+    # Use chunk reading for memory efficiency
+    chunk_reader = pd.read_csv(args.filepath, sep="¤", engine="python", chunksize=chunk_size)
+    
+    for chunk_df in chunk_reader:
+        # Handle test mode: only process first 5 rows total
+        if args.test:
+            if total_rows_processed >= 5:
+                break
+            chunk_df = chunk_df.head(5 - total_rows_processed)
+        
+        rows_in_chunk = len(chunk_df)
+        if rows_in_chunk == 0:
+            break
+            
+        print(f"\nProcessing chunk {chunk_num + 1}: rows {total_rows_processed} to {total_rows_processed + rows_in_chunk - 1}")
 
         try:
             anonymized_chunk, errors = anon_parallel(chunk_df, cols_to_anonymize, workers=args.workers)
@@ -200,9 +205,11 @@ def main():
             write_header = False
 
             print(f"Chunk saved to {tmp_output}")
+            total_rows_processed += rows_in_chunk
+            chunk_num += 1
 
         except Exception as e:
-            error_msg = f"Fatal error processing chunk [{start_idx}:{end_idx}]: {str(e)}"
+            error_msg = f"Fatal error processing chunk {chunk_num + 1}: {str(e)}"
             all_errors.append(error_msg)
             print(f"ERROR: {error_msg}")
             break
@@ -210,6 +217,7 @@ def main():
     print("\n" + "=" * 60)
     print("Processing Summary:")
     print("=" * 60)
+    print(f"Total rows processed: {total_rows_processed}")
 
     if all_errors:
         print(f"ERRORS ENCOUNTERED: {len(all_errors)}")
