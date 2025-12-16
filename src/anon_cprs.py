@@ -14,59 +14,53 @@ PSEUDONYMIZER = Path("/storage/archive/UCPH/DeepFetal/SDS/pseudonymizer")
 def validate_cpr_format(cpr_str):
     """
     Validate CPR format according to requirements:
-    - Exactly 9 or 10 alphanumeric characters
-    - Letters can only appear in positions 8-9 (for temporary CPRs, 10-digit only)
-    Returns (is_valid, error_msg, is_9_digit) tuple.
+    - Exactly 10 alphanumeric characters
+    - Letters can only appear in positions 8-9 (for temporary CPRs)
+    Returns (is_valid, error_msg) tuple.
     """
     if pd.isna(cpr_str) or cpr_str is None:
-        return False, "Value is NaN or None", False
+        return False, "Value is NaN or None"
 
     cleaned = re.sub(r"[^a-zA-Z0-9]", "", str(cpr_str))
 
-    # Accept both 9 and 10 digit CPRs
-    if len(cleaned) == 9:
-        # 9-digit CPR: all must be digits
-        if not cleaned.isdigit():
-            return False, f"9-digit CPR must contain only digits, found: '{cleaned}'", True
-        return True, None, True
-    elif len(cleaned) == 10:
-        # 10-digit CPR: validate format
-        digit_positions = cleaned[0:7] + cleaned[9]
-        if not digit_positions.isdigit():
-            invalid_pos = next(
-                (i for i, c in enumerate(cleaned) if not c.isdigit() and i not in [7, 8]),
-                None,
+    # Only accept 10-digit CPRs
+    if len(cleaned) != 10:
+        return False, f"Length is {len(cleaned)}, expected 10"
+
+    # 10-digit CPR: validate format
+    digit_positions = cleaned[0:7] + cleaned[9]
+    if not digit_positions.isdigit():
+        invalid_pos = next(
+            (i for i, c in enumerate(cleaned) if not c.isdigit() and i not in [7, 8]),
+            None,
+        )
+        if invalid_pos is not None:
+            return (
+                False,
+                f"Position {invalid_pos + 1} must be a digit, found: '{cleaned[invalid_pos]}'",
             )
-            if invalid_pos is not None:
-                return (
-                    False,
-                    f"Position {invalid_pos + 1} must be a digit, found: '{cleaned[invalid_pos]}'",
-                    False,
-                )
-        return True, None, False
-    else:
-        return False, f"Length is {len(cleaned)}, expected 9 or 10", False
+    return True, None
 
 
 def _pseudonymize_one(value):
     """
     Worker function for multiprocessing.
     Takes a single CPR-like value, cleans, validates, then calls the pseudonymizer binary.
-    Returns (pseudonymized_value, is_invalid, is_9_digit) tuple.
-    Invalid entries return (original_value, True, False) to skip them.
+    Returns (pseudonymized_value, is_invalid) tuple.
+    Invalid entries return (original_value, True) to skip them.
     """
     # Preserve missing values
     if pd.isna(value) or value is None or str(value).strip() == "":
-        return (value, False, False)
+        return (value, False)
 
     # Clean the value
     cleaned = re.sub(r"[^a-zA-Z0-9]", "", str(value))
     
     # Validate format
-    is_valid, error_msg, is_9_digit = validate_cpr_format(cleaned)
+    is_valid, error_msg = validate_cpr_format(cleaned)
     if not is_valid:
         # Invalid entry - return original to skip, but mark as invalid
-        return (value, True, False)
+        return (value, True)
 
     try:
         result = subprocess.run(
@@ -78,12 +72,12 @@ def _pseudonymize_one(value):
         pseudonymized = result.stdout.strip()
     except subprocess.CalledProcessError as e:
         # Pseudonymizer failed - skip this entry
-        return (value, True, False)
+        return (value, True)
     except Exception as e:
         # Any other error - skip this entry
-        return (value, True, False)
+        return (value, True)
 
-    return (pseudonymized, False, is_9_digit)
+    return (pseudonymized, False)
 
 
 def anon_parallel(df, cols, workers=None):
@@ -98,7 +92,6 @@ def anon_parallel(df, cols, workers=None):
     errors = []
     stats = {
         "invalid_entries": {},    # {col: [list of invalid values that were skipped]}
-        "nine_digit_cprs": {},    # {col: [list of 9-digit CPR values]}
     }
 
     for col in cols:
@@ -108,7 +101,6 @@ def anon_parallel(df, cols, workers=None):
 
         print(f"Processing column '{col}' (parallel)...")
         stats["invalid_entries"][col] = []
-        stats["nine_digit_cprs"][col] = []
 
         try:
             s = df[col]
@@ -125,17 +117,15 @@ def anon_parallel(df, cols, workers=None):
             with ProcessPoolExecutor(max_workers=workers) as ex:
                 results = list(ex.map(_pseudonymize_one, unique_vals))
 
-            # Extract pseudonymized values, track invalid entries and 9-digit CPRs
+            # Extract pseudonymized values, track invalid entries
             mapping = {}
-            for orig_val, (pseudo_val, is_invalid, is_9_digit) in zip(unique_vals, results):
+            for orig_val, (pseudo_val, is_invalid) in zip(unique_vals, results):
                 if is_invalid:
                     # Invalid entry - keep original value, track it
-                    mapping[orig_val] = orig_val
+                    mapping[orig_val] = None
                     stats["invalid_entries"][col].append(orig_val)
                 else:
                     mapping[orig_val] = pseudo_val
-                    if is_9_digit:
-                        stats["nine_digit_cprs"][col].append(orig_val)
 
             df.loc[mask, col] = s.loc[mask].astype(str).map(mapping)
 
@@ -206,13 +196,12 @@ def main():
     total_rows_processed = 0
     all_stats = {
         "invalid_entries": {},  # Accumulate across all chunks
-        "nine_digit_cprs": {},   # Accumulate across all chunks
     }
 
     print(f"Reading file in chunks: {args.filepath}")
     
     # Use chunk reading for memory efficiency
-    chunk_reader = pd.read_csv(args.filepath, sep="¤", engine="python", chunksize=chunk_size)
+    chunk_reader = pd.read_csv(args.filepath, sep="¤", engine="python", chunksize=chunk_size, dtype={col: 'string' for col in cols_to_anonymize})
     
     for chunk_df in chunk_reader:
         # Handle test mode: only process first 5 rows total
@@ -236,11 +225,6 @@ def main():
                 if col not in all_stats["invalid_entries"]:
                     all_stats["invalid_entries"][col] = []
                 all_stats["invalid_entries"][col].extend(stats["invalid_entries"][col])
-            
-            for col in stats["nine_digit_cprs"]:
-                if col not in all_stats["nine_digit_cprs"]:
-                    all_stats["nine_digit_cprs"][col] = []
-                all_stats["nine_digit_cprs"][col].extend(stats["nine_digit_cprs"][col])
 
             if errors:
                 print(f"ERROR: Encountered {len(errors)} error(s). Stopping processing.")
@@ -270,13 +254,6 @@ def main():
     print("Processing Summary:")
     print("=" * 60)
     print(f"Total rows processed: {total_rows_processed}")
-
-    # Report 9-digit CPR statistics
-    for col in all_stats["nine_digit_cprs"]:
-        nine_digit_list = all_stats["nine_digit_cprs"][col]
-        if nine_digit_list:
-            unique_nine_digit = list(set(nine_digit_list))
-            print(f"\nColumn '{col}': {len(unique_nine_digit)} unique 9-digit CPR(s) found and processed")
 
     # Collect and save invalid entries that were skipped
     skipped_cprs_file = args.output.replace(".asc", "_skipped_cprs.csv")
